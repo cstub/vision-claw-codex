@@ -118,19 +118,32 @@ class StreamSessionViewModel: ObservableObject {
     }
 
     // Subscribe to video frames from the device camera
+    // This callback fires whether the app is in the foreground or background,
+    // enabling continuous streaming even when the screen is locked.
     videoFrameListenerToken = streamSession.videoFramePublisher.listen { [weak self] videoFrame in
       Task { @MainActor [weak self] in
         guard let self else { return }
 
-        if let image = videoFrame.makeUIImage() {
-          self.currentVideoFrame = image
-          if !self.hasReceivedFirstFrame {
-            self.hasReceivedFirstFrame = true
+        let isInBackground = UIApplication.shared.applicationState == .background
+
+        // Only decode to UIImage when in foreground (avoid VideoToolbox issues when locked)
+        if !isInBackground {
+          if let image = videoFrame.makeUIImage() {
+            self.currentVideoFrame = image
+            if !self.hasReceivedFirstFrame {
+              self.hasReceivedFirstFrame = true
+            }
+            // Forward video frames to Gemini Live (throttled internally to ~1fps)
+            self.geminiSessionVM?.sendVideoFrameIfThrottled(image: image)
+            // Forward video frames to WebRTC (no throttle -- WebRTC handles bitrate)
+            self.webrtcSessionVM?.pushVideoFrame(image)
           }
-          // Forward video frames to Gemini Live (throttled internally to ~1fps)
-          self.geminiSessionVM?.sendVideoFrameIfThrottled(image: image)
-          // Forward video frames to WebRTC (no throttle — WebRTC handles bitrate)
-          self.webrtcSessionVM?.pushVideoFrame(image)
+        } else {
+          // In background: still forward to Gemini/WebRTC if possible
+          if let image = videoFrame.makeUIImage() {
+            self.geminiSessionVM?.sendVideoFrameIfThrottled(image: image)
+            self.webrtcSessionVM?.pushVideoFrame(image)
+          }
         }
       }
     }

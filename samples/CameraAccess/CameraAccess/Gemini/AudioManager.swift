@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import UIKit
 
 class AudioManager {
   var onAudioCaptured: ((Data) -> Void)?
@@ -7,6 +8,8 @@ class AudioManager {
   private let audioEngine = AVAudioEngine()
   private let playerNode = AVAudioPlayerNode()
   private var isCapturing = false
+  private var wasCapturingBeforeInterruption = false
+  private var useIPhoneMode = false
 
   private let outputFormat: AVAudioFormat
 
@@ -14,6 +17,12 @@ class AudioManager {
   private let sendQueue = DispatchQueue(label: "audio.accumulator")
   private var accumulatedData = Data()
   private let minSendBytes = 3200  // 100ms at 16kHz mono Int16 = 1600 frames * 2 bytes
+
+  // Notification observers for background resilience
+  private var interruptionObserver: NSObjectProtocol?
+  private var routeChangeObserver: NSObjectProtocol?
+  private var mediaServicesResetObserver: NSObjectProtocol?
+  private var foregroundObserver: NSObjectProtocol?
 
   init() {
     self.outputFormat = AVAudioFormat(
@@ -25,19 +34,30 @@ class AudioManager {
   }
 
   func setupAudioSession(useIPhoneMode: Bool = false) throws {
+    self.useIPhoneMode = useIPhoneMode
     let session = AVAudioSession.sharedInstance()
     // iPhone mode: voiceChat for aggressive echo cancellation (mic + speaker co-located)
-    // Glasses mode: videoChat for mild AEC (mic is on glasses, speaker is on phone)
-    let mode: AVAudioSession.Mode = useIPhoneMode ? .voiceChat : .videoChat
-    try session.setCategory(
-      .playAndRecord,
-      mode: mode,
-      options: [.defaultToSpeaker, .allowBluetooth]
-    )
+    // Glasses mode: allowBluetoothHFP + mixWithOthers for background streaming support
+    if useIPhoneMode {
+      try session.setCategory(
+        .playAndRecord,
+        mode: .voiceChat,
+        options: [.defaultToSpeaker, .allowBluetooth]
+      )
+    } else {
+      try session.setCategory(
+        .playAndRecord,
+        mode: .videoChat,
+        options: [.allowBluetoothHFP, .mixWithOthers, .defaultToSpeaker]
+      )
+    }
     try session.setPreferredSampleRate(GeminiConfig.inputAudioSampleRate)
     try session.setPreferredIOBufferDuration(0.064)
     try session.setActive(true)
     NSLog("[Audio] Session mode: %@", useIPhoneMode ? "voiceChat (iPhone)" : "videoChat (glasses)")
+
+    setupInterruptionHandling()
+    setupAppLifecycleObservers()
   }
 
   func startCapture() throws {
@@ -86,7 +106,6 @@ class AudioManager {
 
       tapCount += 1
       let pcmData: Data
-      let rms: Float
 
       if let converter {
         let resampleFormat = AVAudioFormat(
@@ -100,17 +119,9 @@ class AudioManager {
           return
         }
         pcmData = self.float32BufferToInt16Data(resampled)
-        rms = self.computeRMS(resampled)
       } else {
         pcmData = self.float32BufferToInt16Data(buffer)
-        rms = self.computeRMS(buffer)
       }
-
-      // Log first 3 taps, then every ~2 seconds (every 8th tap at 4096 frames/16kHz = ~256ms each)
-      // if tapCount <= 3 || tapCount % 8 == 0 {
-      //   NSLog("[Audio] Tap #%d: %d frames, %d bytes, rms=%.4f",
-      //         tapCount, buffer.frameLength, pcmData.count, rms)
-      // }
 
       // Accumulate into ~100ms chunks before sending to Gemini
       self.sendQueue.async {
@@ -181,6 +192,156 @@ class AudioManager {
         self.accumulatedData = Data()
         self.onAudioCaptured?(chunk)
       }
+    }
+    removeObservers()
+  }
+
+  // MARK: - Audio Interruption & Route Change Handling
+
+  private func setupInterruptionHandling() {
+    interruptionObserver = NotificationCenter.default.addObserver(
+      forName: AVAudioSession.interruptionNotification,
+      object: AVAudioSession.sharedInstance(),
+      queue: .main
+    ) { [weak self] notification in
+      guard let self,
+            let userInfo = notification.userInfo,
+            let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+            let type = AVAudioSession.InterruptionType(rawValue: typeValue)
+      else { return }
+
+      var shouldResume = false
+      if type == .ended,
+         let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt {
+        let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
+        shouldResume = options.contains(.shouldResume)
+      }
+
+      self.handleInterruption(type: type, shouldResume: shouldResume)
+    }
+
+    routeChangeObserver = NotificationCenter.default.addObserver(
+      forName: AVAudioSession.routeChangeNotification,
+      object: AVAudioSession.sharedInstance(),
+      queue: .main
+    ) { [weak self] notification in
+      guard let self,
+            let userInfo = notification.userInfo,
+            let reasonValue = userInfo[AVAudioSessionRouteChangeReasonKey] as? UInt,
+            let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue)
+      else { return }
+
+      self.handleRouteChange(reason: reason)
+    }
+
+    mediaServicesResetObserver = NotificationCenter.default.addObserver(
+      forName: AVAudioSession.mediaServicesWereResetNotification,
+      object: AVAudioSession.sharedInstance(),
+      queue: .main
+    ) { [weak self] _ in
+      self?.attemptAudioReset()
+    }
+  }
+
+  private func setupAppLifecycleObservers() {
+    foregroundObserver = NotificationCenter.default.addObserver(
+      forName: UIApplication.willEnterForegroundNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      guard let self else { return }
+      NSLog("[Audio] App will enter foreground")
+      if self.isCapturing && !self.audioEngine.isRunning {
+        NSLog("[Audio] Audio engine stopped while backgrounded, attempting reset")
+        self.attemptAudioReset()
+      }
+    }
+  }
+
+  private func handleInterruption(type: AVAudioSession.InterruptionType, shouldResume: Bool) {
+    switch type {
+    case .began:
+      NSLog("[Audio] Audio interruption began (e.g. phone call)")
+      wasCapturingBeforeInterruption = isCapturing
+      if isCapturing {
+        audioEngine.pause()
+      }
+    case .ended:
+      NSLog("[Audio] Audio interruption ended (shouldResume=%@)", shouldResume ? "true" : "false")
+      if wasCapturingBeforeInterruption {
+        resumeAudioAfterInterruption()
+      }
+    @unknown default:
+      break
+    }
+  }
+
+  private func handleRouteChange(reason: AVAudioSession.RouteChangeReason) {
+    switch reason {
+    case .newDeviceAvailable:
+      NSLog("[Audio] New audio device available")
+    case .oldDeviceUnavailable:
+      NSLog("[Audio] Audio device removed")
+      if isCapturing {
+        attemptAudioReset()
+      }
+    case .categoryChange, .override, .wakeFromSleep, .routeConfigurationChange:
+      NSLog("[Audio] Audio route change: %d", reason.rawValue)
+    default:
+      break
+    }
+  }
+
+  private func resumeAudioAfterInterruption() {
+    NSLog("[Audio] Resuming audio after interruption")
+    let audioSession = AVAudioSession.sharedInstance()
+    do {
+      try audioSession.setActive(true)
+      try audioEngine.start()
+      NSLog("[Audio] Audio resumed successfully")
+    } catch {
+      NSLog("[Audio] Failed to resume audio: %@", error.localizedDescription)
+      attemptAudioReset()
+    }
+  }
+
+  private func attemptAudioReset() {
+    NSLog("[Audio] Attempting audio reset")
+    let wasCapturing = isCapturing
+
+    if audioEngine.isRunning {
+      audioEngine.stop()
+    }
+    audioEngine.inputNode.removeTap(onBus: 0)
+    isCapturing = false
+
+    if wasCapturing {
+      do {
+        try setupAudioSession(useIPhoneMode: useIPhoneMode)
+        try startCapture()
+        NSLog("[Audio] Audio reset successful")
+      } catch {
+        NSLog("[Audio] Audio reset failed: %@", error.localizedDescription)
+      }
+    }
+  }
+
+  private func removeObservers() {
+    if let observer = interruptionObserver {
+      NotificationCenter.default.removeObserver(observer)
+      interruptionObserver = nil
+    }
+    if let observer = routeChangeObserver {
+      NotificationCenter.default.removeObserver(observer)
+      routeChangeObserver = nil
+    }
+    if let observer = mediaServicesResetObserver {
+      NotificationCenter.default.removeObserver(observer)
+      mediaServicesResetObserver = nil
+    }
+    if let observer = foregroundObserver {
+      NotificationCenter.default.removeObserver(observer)
+      foregroundObserver = nil
     }
   }
 
