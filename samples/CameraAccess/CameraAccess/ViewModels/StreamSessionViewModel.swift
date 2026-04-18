@@ -134,6 +134,17 @@ class StreamSessionViewModel: ObservableObject {
 
   private static let defaultPhotoAnalysisPrompt = "How do you pronounce this?"
 
+  private static func homeworkPhotoAnalysisPrompt(for question: String) -> String {
+    """
+    You are helping a student with homework.
+    Use the attached photo as the primary source of truth.
+    Answer the user's question directly and concisely based on what is visible in the image.
+    If the image does not contain enough information or is too blurry to answer, say that briefly.
+
+    User question: "\(question)"
+    """
+  }
+
   init(
     wearables: WearablesInterface,
     openClawBridge: OpenClawBridge? = nil
@@ -383,7 +394,8 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   func analyzePhotoWithOpenClaw(
-    prompt: String? = nil
+    prompt: String? = nil,
+    toolName: String = "analyze"
   ) async -> Result<String, Error> {
     let prompt = prompt ?? StreamSessionViewModel.defaultPhotoAnalysisPrompt
 
@@ -413,9 +425,30 @@ class StreamSessionViewModel: ObservableObject {
       }
 
       photoAnalysisNote = await persistAnalyzedPhotoToLibrary(jpegData)
-      return await openClawBridge.analyzeImage(jpegData: jpegData, prompt: prompt)
+      return await openClawBridge.analyzeImage(
+        jpegData: jpegData,
+        prompt: prompt,
+        toolName: toolName
+      )
     } catch {
       return .failure(error)
+    }
+  }
+
+  func executeHomeworkQuestion(_ question: String) async -> ToolResult {
+    let trimmedQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedQuestion.isEmpty else {
+      return .failure("Missing homework question for photo analysis.")
+    }
+
+    let prompt = StreamSessionViewModel.homeworkPhotoAnalysisPrompt(for: trimmedQuestion)
+    let result = await analyzePhotoWithOpenClaw(prompt: prompt, toolName: "execute")
+
+    switch result {
+    case .success(let text):
+      return .success(text)
+    case .failure(let error):
+      return .failure(photoAnalysisMessage(from: error))
     }
   }
 

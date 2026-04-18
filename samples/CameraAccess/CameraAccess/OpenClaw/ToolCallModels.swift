@@ -90,13 +90,13 @@ enum ToolDeclarations {
 
   static let execute: [String: Any] = [
     "name": "execute",
-    "description": "Your only way to take action. You have no memory, storage, or ability to do anything on your own -- use this tool for everything: sending messages, searching the web, adding to lists, setting reminders, creating notes, research, drafts, scheduling, smart home control, app interactions, or any request that goes beyond answering a question. When in doubt, use this tool.",
+    "description": "Use this only for homework help about the material in view. It captures a fresh high-resolution photo, sends that photo plus the user's question to the homework analysis backend, and returns the answer. Use this instead of trying to read fine text from the live video stream.",
     "parameters": [
       "type": "object",
       "properties": [
         "task": [
           "type": "string",
-          "description": "Clear, detailed description of what to do. Include all relevant context: names, content, platforms, quantities, etc."
+          "description": "The user's homework question. Preserve the original meaning of the question and include any short context that is necessary to answer it correctly."
         ]
       ],
       "required": ["task"]

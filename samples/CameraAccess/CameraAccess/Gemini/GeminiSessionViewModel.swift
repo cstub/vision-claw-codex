@@ -12,7 +12,7 @@ class GeminiSessionViewModel: ObservableObject {
   @Published var toolCallStatus: ToolCallStatus = .idle
   @Published var openClawConnectionState: OpenClawConnectionState = .notConfigured
   private let geminiService = GeminiLiveService()
-  private let openClawBridge = OpenClawBridge()
+  private let openClawBridge: OpenClawBridge
   private var toolCallRouter: ToolCallRouter?
   private let audioManager = AudioManager()
   private let eventClient = OpenClawEventClient()
@@ -20,6 +20,11 @@ class GeminiSessionViewModel: ObservableObject {
   private var stateObservation: Task<Void, Never>?
 
   var streamingMode: StreamingMode = .glasses
+  var executeHandler: ((String) async -> ToolResult)?
+
+  init(openClawBridge: OpenClawBridge) {
+    self.openClawBridge = openClawBridge
+  }
 
   func startSession() async {
     guard !isGeminiActive else { return }
@@ -79,6 +84,7 @@ class GeminiSessionViewModel: ObservableObject {
       guard let self else { return }
       Task { @MainActor in
         guard self.isGeminiActive else { return }
+        NSLog("[Gemini] Disconnected: %@", reason ?? "unknown")
         self.stopSession()
         self.errorMessage = "Connection lost: \(reason ?? "Unknown error")"
       }
@@ -89,7 +95,12 @@ class GeminiSessionViewModel: ObservableObject {
     openClawBridge.resetSession()
 
     // Wire tool call handling
-    toolCallRouter = ToolCallRouter(bridge: openClawBridge)
+    toolCallRouter = ToolCallRouter(bridge: openClawBridge) { [weak self] task in
+      guard let executeHandler = self?.executeHandler else {
+        return .failure("Homework photo analysis is unavailable right now.")
+      }
+      return await executeHandler(task)
+    }
 
     geminiService.onToolCall = { [weak self] toolCall in
       guard let self else { return }

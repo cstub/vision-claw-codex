@@ -163,9 +163,9 @@ class OpenClawBridge: ObservableObject {
 
   func analyzeImage(
     jpegData: Data,
-    prompt: String
+    prompt: String,
+    toolName: String = "analyze"
   ) async -> Result<String, Error> {
-    let toolName = "analyze"
     lastToolCallStatus = .executing(toolName)
 
     guard GeminiConfig.isOpenClawConfigured else {

@@ -126,7 +126,7 @@ class OpenClawEventClient {
         "minProtocol": 3,
         "maxProtocol": 3,
         "client": [
-          "id": "ios-node",
+          "id": "openclaw-ios",
           "displayName": "VisionClaw Glass",
           "version": "1.0",
           "platform": "ios",
