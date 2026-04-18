@@ -97,9 +97,16 @@ struct StreamView: View {
       // Bottom controls layer
       VStack {
         Spacer()
+        if let message = viewModel.photoSaveConfirmationMessage {
+          PhotoSaveToastView(message: message)
+            .padding(.bottom, 12)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+
         ControlsView(viewModel: viewModel, geminiVM: geminiVM, webrtcVM: webrtcVM)
       }
       .padding(.all, 24)
+      .animation(.easeInOut(duration: 0.2), value: viewModel.photoSaveConfirmationMessage)
     }
     .onDisappear {
       Task {
@@ -112,17 +119,6 @@ struct StreamView: View {
         if webrtcVM.isActive {
           webrtcVM.stopSession()
         }
-      }
-    }
-    // Show captured photos from DAT SDK in a preview sheet
-    .sheet(isPresented: $viewModel.showPhotoPreview) {
-      if let photo = viewModel.capturedPhoto {
-        PhotoPreviewView(
-          photo: photo,
-          onDismiss: {
-            viewModel.dismissPhotoPreview()
-          }
-        )
       }
     }
     // Gemini error alert
@@ -165,12 +161,11 @@ struct ControlsView: View {
         }
       }
 
-      // Photo button (glasses mode only -- DAT SDK capture)
-      if viewModel.streamingMode == .glasses {
-        CircleButton(icon: "camera.fill", text: nil) {
-          viewModel.capturePhoto()
-        }
+      CircleButton(icon: "camera.fill", text: nil) {
+        viewModel.capturePhoto()
       }
+      .opacity(viewModel.isPhotoActionInProgress ? 0.4 : 1.0)
+      .disabled(viewModel.isPhotoActionInProgress)
 
       // Gemini AI button (disabled when WebRTC is active — audio conflict)
       CircleButton(
@@ -206,5 +201,24 @@ struct ControlsView: View {
       .opacity(geminiVM.isGeminiActive ? 0.4 : 1.0)
       .disabled(geminiVM.isGeminiActive)
     }
+  }
+}
+
+private struct PhotoSaveToastView: View {
+  let message: String
+
+  var body: some View {
+    HStack(spacing: 8) {
+      Image(systemName: "checkmark.circle.fill")
+        .foregroundColor(.green)
+      Text(message)
+        .font(.system(size: 14, weight: .medium))
+        .foregroundColor(.white)
+    }
+    .padding(.horizontal, 14)
+    .padding(.vertical, 10)
+    .background(Color.black.opacity(0.75))
+    .clipShape(Capsule())
+    .allowsHitTesting(false)
   }
 }

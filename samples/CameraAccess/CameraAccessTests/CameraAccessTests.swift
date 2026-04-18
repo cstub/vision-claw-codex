@@ -16,9 +16,43 @@ import XCTest
 
 @MainActor
 class ViewModelIntegrationTests: XCTestCase {
+  private final class MockPhotoLibrarySaver: PhotoLibrarySaving {
+    private(set) var savedImages: [UIImage] = []
+
+    func savePhoto(_ image: UIImage) async throws {
+      savedImages.append(image)
+    }
+  }
+
+  private final class FailingPhotoLibrarySaver: PhotoLibrarySaving {
+    let error: Error
+
+    init(error: Error) {
+      self.error = error
+    }
+
+    func savePhoto(_ image: UIImage) async throws {
+      throw error
+    }
+  }
 
   private var mockDevice: MockRaybanMeta?
   private var cameraKit: MockCameraKit?
+
+  private func waitFor(
+    timeoutNanoseconds: UInt64 = 10_000_000_000,
+    pollNanoseconds: UInt64 = 100_000_000,
+    condition: @escaping () -> Bool
+  ) async throws {
+    let maxAttempts = max(1, Int(timeoutNanoseconds / pollNanoseconds))
+    for _ in 0..<maxAttempts {
+      if condition() {
+        return
+      }
+      try await Task.sleep(nanoseconds: pollNanoseconds)
+    }
+    XCTFail("Timed out waiting for condition")
+  }
 
   override func setUp() async throws {
     try await super.setUp()
@@ -115,7 +149,11 @@ class ViewModelIntegrationTests: XCTestCase {
     await camera.setCameraFeed(fileURL: videoURL)
     await camera.setCapturedImage(fileURL: imageURL)
 
-    let viewModel = StreamSessionViewModel(wearables: Wearables.shared)
+    let photoSaver = MockPhotoLibrarySaver()
+    let viewModel = StreamSessionViewModel(
+      wearables: Wearables.shared,
+      photoLibrarySaver: photoSaver
+    )
 
     // Initially not streaming
     XCTAssertEqual(viewModel.streamingStatus, .stopped)
@@ -137,22 +175,85 @@ class ViewModelIntegrationTests: XCTestCase {
 
     // Capture photo while streaming
     viewModel.capturePhoto()
-    try await Task.sleep(nanoseconds: 10_000_000_000)
+    try await waitFor { photoSaver.savedImages.count == 1 }
 
-    // Verify photo captured while maintaining stream (allow for some timing flexibility)
-    XCTAssertTrue(viewModel.capturedPhoto != nil)
-    XCTAssertTrue(viewModel.showPhotoPreview)
+    // Verify photo saved while maintaining stream
+    XCTAssertEqual(photoSaver.savedImages.count, 1)
+    XCTAssertEqual(viewModel.photoSaveConfirmationMessage, "Saved to Photos")
+    XCTAssertFalse(viewModel.isPhotoActionInProgress)
     XCTAssertTrue(viewModel.isStreaming)
-
-    // Dismiss photo and stop streaming
-    viewModel.dismissPhotoPreview()
-    XCTAssertFalse(viewModel.showPhotoPreview)
-    XCTAssertNil(viewModel.capturedPhoto)
 
     await viewModel.stopSession()
     try await Task.sleep(nanoseconds: 1_000_000_000)
 
     XCTAssertFalse(viewModel.isStreaming)
     XCTAssertTrue([.stopped, .waiting].contains(viewModel.streamingStatus))
+  }
+
+  func testIPhoneModePhotoCaptureSavesCurrentFrame() async throws {
+    let photoSaver = MockPhotoLibrarySaver()
+    let viewModel = StreamSessionViewModel(
+      wearables: Wearables.shared,
+      photoLibrarySaver: photoSaver
+    )
+
+    viewModel.streamingMode = .iPhone
+    viewModel.streamingStatus = .streaming
+    viewModel.hasReceivedFirstFrame = true
+    viewModel.currentVideoFrame = UIImage(systemName: "camera.fill")
+
+    viewModel.capturePhoto()
+    try await Task.sleep(nanoseconds: 100_000_000)
+
+    XCTAssertEqual(photoSaver.savedImages.count, 1)
+    XCTAssertEqual(viewModel.photoSaveConfirmationMessage, "Saved to Photos")
+    XCTAssertFalse(viewModel.isPhotoActionInProgress)
+    XCTAssertFalse(viewModel.showError)
+  }
+
+  func testIPhoneModePhotoCaptureWithoutFrameShowsError() async throws {
+    let photoSaver = MockPhotoLibrarySaver()
+    let viewModel = StreamSessionViewModel(
+      wearables: Wearables.shared,
+      photoLibrarySaver: photoSaver
+    )
+
+    viewModel.streamingMode = .iPhone
+    viewModel.streamingStatus = .streaming
+    viewModel.hasReceivedFirstFrame = false
+    viewModel.currentVideoFrame = nil
+
+    viewModel.capturePhoto()
+
+    XCTAssertEqual(photoSaver.savedImages.count, 0)
+    XCTAssertTrue(viewModel.showError)
+    XCTAssertEqual(
+      viewModel.errorMessage,
+      "No iPhone photo is available yet. Wait for the camera preview to start and try again."
+    )
+    XCTAssertFalse(viewModel.isPhotoActionInProgress)
+  }
+
+  func testIPhoneModePhotoCaptureSaveFailureShowsError() async throws {
+    let viewModel = StreamSessionViewModel(
+      wearables: Wearables.shared,
+      photoLibrarySaver: FailingPhotoLibrarySaver(error: PhotoLibrarySaveError.permissionDenied)
+    )
+
+    viewModel.streamingMode = .iPhone
+    viewModel.streamingStatus = .streaming
+    viewModel.hasReceivedFirstFrame = true
+    viewModel.currentVideoFrame = UIImage(systemName: "camera.fill")
+
+    viewModel.capturePhoto()
+    try await Task.sleep(nanoseconds: 100_000_000)
+
+    XCTAssertTrue(viewModel.showError)
+    XCTAssertEqual(
+      viewModel.errorMessage,
+      "Photo Library access is required to save photos. Please allow add-only access in Settings."
+    )
+    XCTAssertNil(viewModel.photoSaveConfirmationMessage)
+    XCTAssertFalse(viewModel.isPhotoActionInProgress)
   }
 }

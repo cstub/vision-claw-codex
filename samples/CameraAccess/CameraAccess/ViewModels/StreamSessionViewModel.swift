@@ -19,6 +19,7 @@ import CoreMedia
 import CoreVideo
 import MWDATCamera
 import MWDATCore
+import Photos
 import SwiftUI
 import VideoToolbox
 
@@ -33,6 +34,58 @@ enum StreamingMode {
   case iPhone
 }
 
+protocol PhotoLibrarySaving {
+  func savePhoto(_ image: UIImage) async throws
+}
+
+enum PhotoLibrarySaveError: LocalizedError {
+  case permissionDenied
+  case saveFailed
+
+  var errorDescription: String? {
+    switch self {
+    case .permissionDenied:
+      return "Photo Library access is required to save photos. Please allow add-only access in Settings."
+    case .saveFailed:
+      return "Saving to Photos failed. Please try again."
+    }
+  }
+}
+
+struct PhotoLibrarySaver: PhotoLibrarySaving {
+  func savePhoto(_ image: UIImage) async throws {
+    let status = await resolvedAuthorizationStatus()
+    guard status == .authorized || status == .limited else {
+      throw PhotoLibrarySaveError.permissionDenied
+    }
+
+    try await withCheckedThrowingContinuation { continuation in
+      PHPhotoLibrary.shared().performChanges({
+        PHAssetCreationRequest.creationRequestForAsset(from: image)
+      }) { success, error in
+        if success {
+          continuation.resume(returning: ())
+        } else {
+          continuation.resume(throwing: error ?? PhotoLibrarySaveError.saveFailed)
+        }
+      }
+    }
+  }
+
+  private func resolvedAuthorizationStatus() async -> PHAuthorizationStatus {
+    let current = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+    guard current == .notDetermined else {
+      return current
+    }
+
+    return await withCheckedContinuation { continuation in
+      PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+        continuation.resume(returning: status)
+      }
+    }
+  }
+}
+
 @MainActor
 class StreamSessionViewModel: ObservableObject {
   @Published var currentVideoFrame: UIImage?
@@ -43,6 +96,8 @@ class StreamSessionViewModel: ObservableObject {
   @Published var hasActiveDevice: Bool = false
   @Published var streamingMode: StreamingMode = .glasses
   @Published var selectedResolution: StreamingResolution = .low
+  @Published var isPhotoActionInProgress: Bool = false
+  @Published var photoSaveConfirmationMessage: String?
 
   var isStreaming: Bool {
     streamingStatus != .stopped
@@ -56,10 +111,6 @@ class StreamSessionViewModel: ObservableObject {
     @unknown default: return "Unknown"
     }
   }
-
-  // Photo capture properties
-  @Published var capturedPhoto: UIImage?
-  @Published var showPhotoPreview: Bool = false
 
   // Gemini Live integration
   var geminiSessionVM: GeminiSessionViewModel?
@@ -75,9 +126,12 @@ class StreamSessionViewModel: ObservableObject {
   private var errorListenerToken: AnyListenerToken?
   private var photoDataListenerToken: AnyListenerToken?
   private let wearables: WearablesInterface
+  private let photoLibrarySaver: any PhotoLibrarySaving
   private let deviceSelector: AutoDeviceSelector
   private var deviceMonitorTask: Task<Void, Never>?
   private var iPhoneCameraManager: IPhoneCameraManager?
+  private var photoSaveFeedbackTask: Task<Void, Never>?
+  private var photoCaptureTimeoutTask: Task<Void, Never>?
 
   // CPU-based CIContext for rendering decoded pixel buffers in background
   private let cpuCIContext = CIContext(options: [.useSoftwareRenderer: true])
@@ -86,8 +140,12 @@ class StreamSessionViewModel: ObservableObject {
   private var backgroundFrameCount = 0
   private var bgDiagLogged = false
 
-  init(wearables: WearablesInterface) {
+  init(
+    wearables: WearablesInterface,
+    photoLibrarySaver: any PhotoLibrarySaving = PhotoLibrarySaver()
+  ) {
     self.wearables = wearables
+    self.photoLibrarySaver = photoLibrarySaver
     // Let the SDK auto-select from available devices
     self.deviceSelector = AutoDeviceSelector(wearables: wearables)
     let config = StreamSessionConfig(
@@ -105,6 +163,12 @@ class StreamSessionViewModel: ObservableObject {
 
     setupVideoDecoder()
     attachListeners()
+  }
+
+  deinit {
+    deviceMonitorTask?.cancel()
+    photoSaveFeedbackTask?.cancel()
+    photoCaptureTimeoutTask?.cancel()
   }
 
   private func setupVideoDecoder() {
@@ -229,10 +293,16 @@ class StreamSessionViewModel: ObservableObject {
     photoDataListenerToken = streamSession.photoDataPublisher.listen { [weak self] photoData in
       Task { @MainActor [weak self] in
         guard let self else { return }
-        if let uiImage = UIImage(data: photoData.data) {
-          self.capturedPhoto = uiImage
-          self.showPhotoPreview = true
+        guard self.isPhotoActionInProgress else {
+          NSLog("[Stream] Ignoring unexpected photo data because no capture is in progress")
+          return
         }
+        self.cancelPhotoCaptureTimeout()
+        guard let uiImage = UIImage(data: photoData.data) else {
+          self.finishPhotoActionWithError("Captured photo could not be processed. Please try again.")
+          return
+        }
+        await self.saveCapturedPhoto(uiImage)
       }
     }
   }
@@ -261,11 +331,13 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   private func showError(_ message: String) {
+    photoSaveConfirmationMessage = nil
     errorMessage = message
     showError = true
   }
 
   func stopSession() async {
+    cancelPhotoCaptureTimeout()
     if streamingMode == .iPhone {
       stopIPhoneSession()
       return
@@ -311,6 +383,7 @@ class StreamSessionViewModel: ObservableObject {
     hasReceivedFirstFrame = false
     streamingStatus = .stopped
     streamingMode = .glasses
+    isPhotoActionInProgress = false
     NSLog("[Stream] iPhone camera mode stopped")
   }
 
@@ -320,17 +393,42 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   func capturePhoto() {
-    streamSession.capturePhoto(format: .jpeg)
-  }
+    guard !isPhotoActionInProgress else {
+      NSLog("[Stream] Photo action already in progress, ignoring request")
+      return
+    }
 
-  func dismissPhotoPreview() {
-    showPhotoPreview = false
-    capturedPhoto = nil
+    guard streamingStatus == .streaming else {
+      showError("Wait for the camera feed to start before taking a photo.")
+      return
+    }
+
+    photoSaveConfirmationMessage = nil
+
+    switch streamingMode {
+    case .glasses:
+      isPhotoActionInProgress = true
+      startPhotoCaptureTimeout()
+      streamSession.capturePhoto(format: .jpeg)
+    case .iPhone:
+      guard hasReceivedFirstFrame, let image = currentVideoFrame else {
+        showError("No iPhone photo is available yet. Wait for the camera preview to start and try again.")
+        return
+      }
+
+      isPhotoActionInProgress = true
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        await self.saveCapturedPhoto(image)
+      }
+    }
   }
 
   private func updateStatusFromState(_ state: StreamSessionState) {
     switch state {
     case .stopped:
+      cancelPhotoCaptureTimeout()
+      isPhotoActionInProgress = false
       currentVideoFrame = nil
       streamingStatus = .stopped
     case .waitingForDevice, .starting, .stopping, .paused:
@@ -360,6 +458,57 @@ class StreamSessionViewModel: ObservableObject {
       return "The hinges on the glasses were closed. Please open the hinges and try again."
     @unknown default:
       return "An unknown streaming error occurred."
+    }
+  }
+
+  private func startPhotoCaptureTimeout() {
+    photoCaptureTimeoutTask?.cancel()
+    photoCaptureTimeoutTask = Task { [weak self] in
+      try? await Task.sleep(nanoseconds: 8_000_000_000)
+      guard !Task.isCancelled else { return }
+
+      await MainActor.run {
+        guard let self, self.isPhotoActionInProgress, self.streamingMode == .glasses else { return }
+        self.finishPhotoActionWithError("Photo capture timed out. Please try again.")
+      }
+    }
+  }
+
+  private func cancelPhotoCaptureTimeout() {
+    photoCaptureTimeoutTask?.cancel()
+    photoCaptureTimeoutTask = nil
+  }
+
+  private func saveCapturedPhoto(_ image: UIImage) async {
+    do {
+      try await photoLibrarySaver.savePhoto(image)
+      finishPhotoAction()
+      showPhotoSaveConfirmation("Saved to Photos")
+    } catch {
+      finishPhotoActionWithError(error.localizedDescription)
+    }
+  }
+
+  private func finishPhotoAction() {
+    cancelPhotoCaptureTimeout()
+    isPhotoActionInProgress = false
+  }
+
+  private func finishPhotoActionWithError(_ message: String) {
+    finishPhotoAction()
+    showError(message)
+  }
+
+  private func showPhotoSaveConfirmation(_ message: String) {
+    photoSaveFeedbackTask?.cancel()
+    photoSaveConfirmationMessage = message
+    photoSaveFeedbackTask = Task { [weak self] in
+      try? await Task.sleep(nanoseconds: 2_000_000_000)
+      guard !Task.isCancelled else { return }
+
+      await MainActor.run {
+        self?.photoSaveConfirmationMessage = nil
+      }
     }
   }
 }
