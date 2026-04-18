@@ -19,6 +19,7 @@ import CoreMedia
 import CoreVideo
 import MWDATCamera
 import MWDATCore
+import Photos
 import SwiftUI
 import VideoToolbox
 
@@ -56,6 +57,20 @@ enum PhotoAnalysisWorkflowError: LocalizedError {
   }
 }
 
+enum PhotoLibrarySaveError: LocalizedError {
+  case accessDenied
+  case saveFailed
+
+  var errorDescription: String? {
+    switch self {
+    case .accessDenied:
+      return "Photo Library access was denied."
+    case .saveFailed:
+      return "The photo could not be saved to Photos."
+    }
+  }
+}
+
 @MainActor
 class StreamSessionViewModel: ObservableObject {
   @Published var currentVideoFrame: UIImage?
@@ -86,6 +101,7 @@ class StreamSessionViewModel: ObservableObject {
   @Published var photoAnalysisText: String?
   @Published var isAnalyzingPhoto: Bool = false
   @Published var photoAnalysisError: String?
+  @Published var photoAnalysisNote: String?
   @Published private(set) var isPhotoCaptureBusy: Bool = false
 
   // Gemini Live integration
@@ -395,6 +411,8 @@ class StreamSessionViewModel: ObservableObject {
         }
         jpegData = try await iPhoneCameraManager.capturePhoto()
       }
+
+      photoAnalysisNote = await persistAnalyzedPhotoToLibrary(jpegData)
       return await openClawBridge.analyzeImage(jpegData: jpegData, prompt: prompt)
     } catch {
       return .failure(error)
@@ -407,6 +425,7 @@ class StreamSessionViewModel: ObservableObject {
     isAnalyzingPhoto = true
     photoAnalysisText = nil
     photoAnalysisError = nil
+    photoAnalysisNote = nil
 
     photoAnalysisTask = Task { @MainActor [weak self] in
       guard let self else { return }
@@ -434,6 +453,7 @@ class StreamSessionViewModel: ObservableObject {
   func dismissPhotoAnalysis() {
     photoAnalysisText = nil
     photoAnalysisError = nil
+    photoAnalysisNote = nil
   }
 
   private func updateStatusFromState(_ state: StreamSessionState) {
@@ -493,10 +513,60 @@ class StreamSessionViewModel: ObservableObject {
     isAnalyzingPhoto = false
     photoAnalysisText = nil
     photoAnalysisError = nil
+    photoAnalysisNote = nil
   }
 
   private func photoAnalysisMessage(from error: Error) -> String {
     (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+  }
+
+  private func persistAnalyzedPhotoToLibrary(_ jpegData: Data) async -> String {
+    do {
+      try await savePhotoToLibrary(jpegData)
+      return "Saved to Photos."
+    } catch {
+      let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+      NSLog("[Photo] Failed to save analyzed photo: %@", message)
+      return "Not saved to Photos: \(message)"
+    }
+  }
+
+  private func savePhotoToLibrary(_ jpegData: Data) async throws {
+    let status = await requestPhotoLibraryAuthorization()
+    switch status {
+    case .authorized, .limited:
+      break
+    default:
+      throw PhotoLibrarySaveError.accessDenied
+    }
+
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      PHPhotoLibrary.shared().performChanges {
+        let creationRequest = PHAssetCreationRequest.forAsset()
+        creationRequest.addResource(with: .photo, data: jpegData, options: nil)
+      } completionHandler: { success, error in
+        if let error {
+          continuation.resume(throwing: error)
+          return
+        }
+        guard success else {
+          continuation.resume(throwing: PhotoLibrarySaveError.saveFailed)
+          return
+        }
+        continuation.resume()
+      }
+    }
+  }
+
+  private func requestPhotoLibraryAuthorization() async -> PHAuthorizationStatus {
+    let currentStatus = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+    guard currentStatus == .notDetermined else { return currentStatus }
+
+    return await withCheckedContinuation { continuation in
+      PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+        continuation.resume(returning: status)
+      }
+    }
   }
 
   private func formatStreamingError(_ error: StreamSessionError) -> String {

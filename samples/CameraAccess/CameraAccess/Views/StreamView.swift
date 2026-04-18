@@ -104,6 +104,7 @@ struct StreamView: View {
               isAnalyzing: viewModel.isAnalyzingPhoto,
               text: viewModel.photoAnalysisText,
               errorText: viewModel.photoAnalysisError,
+              note: viewModel.photoAnalysisNote,
               onDismiss: viewModel.dismissPhotoAnalysis
             )
             .frame(maxHeight: geometry.size.height * 0.7, alignment: .top)
@@ -240,6 +241,7 @@ struct PhotoAnalysisOverlay: View {
   let isAnalyzing: Bool
   let text: String?
   let errorText: String?
+  let note: String?
   let onDismiss: () -> Void
 
   var body: some View {
@@ -269,6 +271,13 @@ struct PhotoAnalysisOverlay: View {
           Text(errorText ?? text ?? "")
             .font(.system(size: 15))
             .foregroundColor(.white)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+
+        if let note, !note.isEmpty {
+          Text(note)
+            .font(.system(size: 13, weight: .medium))
+            .foregroundColor(.white.opacity(0.85))
             .frame(maxWidth: .infinity, alignment: .leading)
         }
       }
