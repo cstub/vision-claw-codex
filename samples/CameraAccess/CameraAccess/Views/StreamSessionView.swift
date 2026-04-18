@@ -19,13 +19,28 @@ struct StreamSessionView: View {
   let wearables: WearablesInterface
   @ObservedObject private var wearablesViewModel: WearablesViewModel
   @StateObject private var viewModel: StreamSessionViewModel
-  @StateObject private var geminiVM = GeminiSessionViewModel()
+  @StateObject private var geminiVM: GeminiSessionViewModel
   @StateObject private var webrtcVM = WebRTCSessionViewModel()
 
   init(wearables: WearablesInterface, wearablesVM: WearablesViewModel) {
     self.wearables = wearables
     self.wearablesViewModel = wearablesVM
-    self._viewModel = StateObject(wrappedValue: StreamSessionViewModel(wearables: wearables))
+    let sharedOpenClawBridge = OpenClawBridge()
+    let streamViewModel = StreamSessionViewModel(
+      wearables: wearables,
+      openClawBridge: sharedOpenClawBridge
+    )
+    let geminiViewModel = GeminiSessionViewModel(openClawBridge: sharedOpenClawBridge)
+    geminiViewModel.executeHandler = { [weak streamViewModel] question in
+      guard let streamViewModel else {
+        return .failure("Homework photo analysis is unavailable right now.")
+      }
+      return await streamViewModel.executeHomeworkQuestion(question)
+    }
+    streamViewModel.geminiSessionVM = geminiViewModel
+
+    self._viewModel = StateObject(wrappedValue: streamViewModel)
+    self._geminiVM = StateObject(wrappedValue: geminiViewModel)
   }
 
   var body: some View {
@@ -43,7 +58,7 @@ struct StreamSessionView: View {
       viewModel.webrtcSessionVM = webrtcVM
       geminiVM.streamingMode = viewModel.streamingMode
     }
-    .onChange(of: viewModel.streamingMode) { newMode in
+    .onChange(of: viewModel.streamingMode) { _, newMode in
       geminiVM.streamingMode = newMode
     }
     .onAppear {

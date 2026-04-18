@@ -19,6 +19,7 @@ import CoreMedia
 import CoreVideo
 import MWDATCamera
 import MWDATCore
+import Photos
 import SwiftUI
 import VideoToolbox
 
@@ -31,6 +32,43 @@ enum StreamingStatus {
 enum StreamingMode {
   case glasses
   case iPhone
+}
+
+enum PhotoAnalysisWorkflowError: LocalizedError {
+  case bridgeUnavailable
+  case captureInProgress
+  case requiresActiveStream
+  case captureUnavailable
+  case cancelled
+
+  var errorDescription: String? {
+    switch self {
+    case .bridgeUnavailable:
+      return "Photo analysis is unavailable right now."
+    case .captureInProgress:
+      return "A photo analysis is already in progress."
+    case .requiresActiveStream:
+      return "Photo analysis requires an active stream."
+    case .captureUnavailable:
+      return "Photo capture is unavailable right now."
+    case .cancelled:
+      return "Photo analysis was cancelled."
+    }
+  }
+}
+
+enum PhotoLibrarySaveError: LocalizedError {
+  case accessDenied
+  case saveFailed
+
+  var errorDescription: String? {
+    switch self {
+    case .accessDenied:
+      return "Photo Library access was denied."
+    case .saveFailed:
+      return "The photo could not be saved to Photos."
+    }
+  }
 }
 
 @MainActor
@@ -60,12 +98,18 @@ class StreamSessionViewModel: ObservableObject {
   // Photo capture properties
   @Published var capturedPhoto: UIImage?
   @Published var showPhotoPreview: Bool = false
+  @Published var photoAnalysisText: String?
+  @Published var isAnalyzingPhoto: Bool = false
+  @Published var photoAnalysisError: String?
+  @Published var photoAnalysisNote: String?
+  @Published private(set) var isPhotoCaptureBusy: Bool = false
 
   // Gemini Live integration
   var geminiSessionVM: GeminiSessionViewModel?
 
   // WebRTC Live streaming integration
   var webrtcSessionVM: WebRTCSessionViewModel?
+  var openClawBridge: OpenClawBridge?
 
   // The core DAT SDK StreamSession - handles all streaming operations
   private var streamSession: StreamSession
@@ -78,6 +122,8 @@ class StreamSessionViewModel: ObservableObject {
   private let deviceSelector: AutoDeviceSelector
   private var deviceMonitorTask: Task<Void, Never>?
   private var iPhoneCameraManager: IPhoneCameraManager?
+  private var pendingPhotoCaptureContinuation: CheckedContinuation<Data, Error>?
+  private var photoAnalysisTask: Task<Void, Never>?
 
   // CPU-based CIContext for rendering decoded pixel buffers in background
   private let cpuCIContext = CIContext(options: [.useSoftwareRenderer: true])
@@ -86,8 +132,25 @@ class StreamSessionViewModel: ObservableObject {
   private var backgroundFrameCount = 0
   private var bgDiagLogged = false
 
-  init(wearables: WearablesInterface) {
+  private static let defaultPhotoAnalysisPrompt = "How do you pronounce this?"
+
+  private static func homeworkPhotoAnalysisPrompt(for question: String) -> String {
+    """
+    You are helping a student with homework.
+    Use the attached photo as the primary source of truth.
+    Answer the user's question directly and concisely based on what is visible in the image.
+    If the image does not contain enough information or is too blurry to answer, say that briefly.
+
+    User question: "\(question)"
+    """
+  }
+
+  init(
+    wearables: WearablesInterface,
+    openClawBridge: OpenClawBridge? = nil
+  ) {
     self.wearables = wearables
+    self.openClawBridge = openClawBridge
     // Let the SDK auto-select from available devices
     self.deviceSelector = AutoDeviceSelector(wearables: wearables)
     let config = StreamSessionConfig(
@@ -229,6 +292,11 @@ class StreamSessionViewModel: ObservableObject {
     photoDataListenerToken = streamSession.photoDataPublisher.listen { [weak self] photoData in
       Task { @MainActor [weak self] in
         guard let self else { return }
+        if self.pendingPhotoCaptureContinuation != nil {
+          self.resumePendingPhotoCapture(with: photoData.data)
+          return
+        }
+
         if let uiImage = UIImage(data: photoData.data) {
           self.capturedPhoto = uiImage
           self.showPhotoPreview = true
@@ -266,6 +334,7 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   func stopSession() async {
+    cancelPhotoAnalysisWorkflow()
     if streamingMode == .iPhone {
       stopIPhoneSession()
       return
@@ -320,12 +389,104 @@ class StreamSessionViewModel: ObservableObject {
   }
 
   func capturePhoto() {
+    guard !isPhotoCaptureBusy else { return }
     streamSession.capturePhoto(format: .jpeg)
+  }
+
+  func analyzePhotoWithOpenClaw(
+    prompt: String? = nil,
+    toolName: String = "analyze"
+  ) async -> Result<String, Error> {
+    let prompt = prompt ?? StreamSessionViewModel.defaultPhotoAnalysisPrompt
+
+    guard !isPhotoCaptureBusy else {
+      return .failure(PhotoAnalysisWorkflowError.captureInProgress)
+    }
+    guard isStreaming else {
+      return .failure(PhotoAnalysisWorkflowError.requiresActiveStream)
+    }
+    guard let openClawBridge else {
+      return .failure(PhotoAnalysisWorkflowError.bridgeUnavailable)
+    }
+
+    isPhotoCaptureBusy = true
+    defer { isPhotoCaptureBusy = false }
+
+    do {
+      let jpegData: Data
+      switch streamingMode {
+      case .glasses:
+        jpegData = try await captureNextPhotoJPEG()
+      case .iPhone:
+        guard let iPhoneCameraManager else {
+          return .failure(PhotoAnalysisWorkflowError.captureUnavailable)
+        }
+        jpegData = try await iPhoneCameraManager.capturePhoto()
+      }
+
+      photoAnalysisNote = await persistAnalyzedPhotoToLibrary(jpegData)
+      return await openClawBridge.analyzeImage(
+        jpegData: jpegData,
+        prompt: prompt,
+        toolName: toolName
+      )
+    } catch {
+      return .failure(error)
+    }
+  }
+
+  func executeHomeworkQuestion(_ question: String) async -> ToolResult {
+    let trimmedQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedQuestion.isEmpty else {
+      return .failure("Missing homework question for photo analysis.")
+    }
+
+    let prompt = StreamSessionViewModel.homeworkPhotoAnalysisPrompt(for: trimmedQuestion)
+    let result = await analyzePhotoWithOpenClaw(prompt: prompt, toolName: "execute")
+
+    switch result {
+    case .success(let text):
+      return .success(text)
+    case .failure(let error):
+      return .failure(photoAnalysisMessage(from: error))
+    }
+  }
+
+  func capturePhotoForAnalysis() {
+    guard !isPhotoCaptureBusy else { return }
+
+    isAnalyzingPhoto = true
+    photoAnalysisText = nil
+    photoAnalysisError = nil
+    photoAnalysisNote = nil
+
+    photoAnalysisTask = Task { @MainActor [weak self] in
+      guard let self else { return }
+      defer { self.photoAnalysisTask = nil }
+
+      let result = await self.analyzePhotoWithOpenClaw()
+      guard !Task.isCancelled else { return }
+
+      switch result {
+      case .success(let text):
+        self.photoAnalysisText = text
+      case .failure(let error):
+        self.photoAnalysisError = self.photoAnalysisMessage(from: error)
+      }
+
+      self.isAnalyzingPhoto = false
+    }
   }
 
   func dismissPhotoPreview() {
     showPhotoPreview = false
     capturedPhoto = nil
+  }
+
+  func dismissPhotoAnalysis() {
+    photoAnalysisText = nil
+    photoAnalysisError = nil
+    photoAnalysisNote = nil
   }
 
   private func updateStatusFromState(_ state: StreamSessionState) {
@@ -337,6 +498,107 @@ class StreamSessionViewModel: ObservableObject {
       streamingStatus = .waiting
     case .streaming:
       streamingStatus = .streaming
+    }
+  }
+
+  private func captureNextPhotoJPEG() async throws -> Data {
+    try await withTaskCancellationHandler(
+      operation: {
+        try await withCheckedThrowingContinuation { [weak self] (continuation: CheckedContinuation<Data, Error>) in
+          guard let self else {
+            continuation.resume(throwing: PhotoAnalysisWorkflowError.cancelled)
+            return
+          }
+          guard self.pendingPhotoCaptureContinuation == nil else {
+            continuation.resume(throwing: PhotoAnalysisWorkflowError.captureInProgress)
+            return
+          }
+
+          self.pendingPhotoCaptureContinuation = continuation
+          self.streamSession.capturePhoto(format: .jpeg)
+        }
+      },
+      onCancel: { [weak self] in
+        Task { @MainActor [weak self] in
+          self?.cancelPendingPhotoCapture(with: PhotoAnalysisWorkflowError.cancelled)
+        }
+      }
+    )
+  }
+
+  private func resumePendingPhotoCapture(with data: Data) {
+    guard let continuation = pendingPhotoCaptureContinuation else { return }
+    pendingPhotoCaptureContinuation = nil
+    continuation.resume(returning: data)
+  }
+
+  private func cancelPendingPhotoCapture(with error: Error) {
+    guard let continuation = pendingPhotoCaptureContinuation else { return }
+    pendingPhotoCaptureContinuation = nil
+    continuation.resume(throwing: error)
+  }
+
+  private func cancelPhotoAnalysisWorkflow() {
+    photoAnalysisTask?.cancel()
+    photoAnalysisTask = nil
+    cancelPendingPhotoCapture(with: PhotoAnalysisWorkflowError.cancelled)
+    isPhotoCaptureBusy = false
+    isAnalyzingPhoto = false
+    photoAnalysisText = nil
+    photoAnalysisError = nil
+    photoAnalysisNote = nil
+  }
+
+  private func photoAnalysisMessage(from error: Error) -> String {
+    (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+  }
+
+  private func persistAnalyzedPhotoToLibrary(_ jpegData: Data) async -> String {
+    do {
+      try await savePhotoToLibrary(jpegData)
+      return "Saved to Photos."
+    } catch {
+      let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+      NSLog("[Photo] Failed to save analyzed photo: %@", message)
+      return "Not saved to Photos: \(message)"
+    }
+  }
+
+  private func savePhotoToLibrary(_ jpegData: Data) async throws {
+    let status = await requestPhotoLibraryAuthorization()
+    switch status {
+    case .authorized, .limited:
+      break
+    default:
+      throw PhotoLibrarySaveError.accessDenied
+    }
+
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      PHPhotoLibrary.shared().performChanges {
+        let creationRequest = PHAssetCreationRequest.forAsset()
+        creationRequest.addResource(with: .photo, data: jpegData, options: nil)
+      } completionHandler: { success, error in
+        if let error {
+          continuation.resume(throwing: error)
+          return
+        }
+        guard success else {
+          continuation.resume(throwing: PhotoLibrarySaveError.saveFailed)
+          return
+        }
+        continuation.resume()
+      }
+    }
+  }
+
+  private func requestPhotoLibraryAuthorization() async -> PHAuthorizationStatus {
+    let currentStatus = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+    guard currentStatus == .notDetermined else { return currentStatus }
+
+    return await withCheckedContinuation { continuation in
+      PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+        continuation.resume(returning: status)
+      }
     }
   }
 

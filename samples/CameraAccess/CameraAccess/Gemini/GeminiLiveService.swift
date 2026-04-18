@@ -63,6 +63,7 @@ class GeminiLiveService: ObservableObject {
       self.delegate.onClose = { [weak self] code, reason in
         guard let self else { return }
         let reasonStr = reason.flatMap { String(data: $0, encoding: .utf8) } ?? "no reason"
+        NSLog("[Gemini] WS closed: code=%d reason=%@", code.rawValue, reasonStr)
         Task { @MainActor in
           self.resolveConnect(success: false)
           self.connectionState = .disconnected
@@ -74,6 +75,7 @@ class GeminiLiveService: ObservableObject {
       self.delegate.onError = { [weak self] error in
         guard let self else { return }
         let msg = error?.localizedDescription ?? "Unknown error"
+        NSLog("[Gemini] WS error: %@", msg)
         Task { @MainActor in
           self.resolveConnect(success: false)
           self.connectionState = .error(msg)
@@ -248,6 +250,7 @@ class GeminiLiveService: ObservableObject {
         } catch {
           if !Task.isCancelled {
             let reason = error.localizedDescription
+            NSLog("[Gemini] WS receive error: %@", reason)
             await MainActor.run {
               self.resolveConnect(success: false)
               self.connectionState = .disconnected
@@ -278,6 +281,7 @@ class GeminiLiveService: ObservableObject {
     if let goAway = json["goAway"] as? [String: Any] {
       let timeLeft = goAway["timeLeft"] as? [String: Any]
       let seconds = timeLeft?["seconds"] as? Int ?? 0
+      NSLog("[Gemini] goAway received: timeLeft=%ds raw=%@", seconds, String(describing: goAway))
       connectionState = .disconnected
       isModelSpeaking = false
       onDisconnected?("Server closing (time left: \(seconds)s)")

@@ -28,7 +28,16 @@ final class SettingsManager {
   }
 
   var geminiSystemPrompt: String {
-    get { defaults.string(forKey: Key.geminiSystemPrompt.rawValue) ?? GeminiConfig.defaultSystemInstruction }
+    get {
+      guard let stored = defaults.string(forKey: Key.geminiSystemPrompt.rawValue) else {
+        return GeminiConfig.defaultSystemInstruction
+      }
+      if stored == GeminiConfig.legacyDefaultSystemInstruction {
+        defaults.set(GeminiConfig.defaultSystemInstruction, forKey: Key.geminiSystemPrompt.rawValue)
+        return GeminiConfig.defaultSystemInstruction
+      }
+      return stored
+    }
     set { defaults.set(newValue, forKey: Key.geminiSystemPrompt.rawValue) }
   }
 

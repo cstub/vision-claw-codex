@@ -94,6 +94,26 @@ struct StreamView: View {
         .padding(.all, 24)
       }
 
+      if viewModel.isAnalyzingPhoto
+        || viewModel.photoAnalysisText != nil
+        || viewModel.photoAnalysisError != nil {
+        GeometryReader { geometry in
+          VStack {
+            Spacer()
+            PhotoAnalysisOverlay(
+              isAnalyzing: viewModel.isAnalyzingPhoto,
+              text: viewModel.photoAnalysisText,
+              errorText: viewModel.photoAnalysisError,
+              note: viewModel.photoAnalysisNote,
+              onDismiss: viewModel.dismissPhotoAnalysis
+            )
+            .frame(maxHeight: geometry.size.height * 0.7, alignment: .top)
+          }
+          .padding(.horizontal, 24)
+          .padding(.bottom, 96)
+        }
+      }
+
       // Bottom controls layer
       VStack {
         Spacer()
@@ -165,12 +185,20 @@ struct ControlsView: View {
         }
       }
 
-      // Photo button (glasses mode only -- DAT SDK capture)
+      // Glasses preview button (DAT SDK capture)
       if viewModel.streamingMode == .glasses {
         CircleButton(icon: "camera.fill", text: nil) {
           viewModel.capturePhoto()
         }
+        .opacity(viewModel.isPhotoCaptureBusy ? 0.4 : 1.0)
+        .disabled(viewModel.isPhotoCaptureBusy)
       }
+
+      CircleButton(icon: "text.viewfinder", text: "Photo") {
+        viewModel.capturePhotoForAnalysis()
+      }
+      .opacity(viewModel.isPhotoCaptureBusy ? 0.4 : 1.0)
+      .disabled(viewModel.isPhotoCaptureBusy)
 
       // Gemini AI button (disabled when WebRTC is active — audio conflict)
       CircleButton(
@@ -206,5 +234,58 @@ struct ControlsView: View {
       .opacity(geminiVM.isGeminiActive ? 0.4 : 1.0)
       .disabled(geminiVM.isGeminiActive)
     }
+  }
+}
+
+struct PhotoAnalysisOverlay: View {
+  let isAnalyzing: Bool
+  let text: String?
+  let errorText: String?
+  let note: String?
+  let onDismiss: () -> Void
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      if isAnalyzing {
+        HStack(spacing: 12) {
+          ProgressView()
+            .tint(.white)
+          Text("Analyzing photo...")
+            .font(.system(size: 15, weight: .medium))
+            .foregroundColor(.white)
+        }
+      } else {
+        HStack(spacing: 12) {
+          Text(errorText == nil ? "Photo" : "Photo Error")
+            .font(.system(size: 15, weight: .semibold))
+            .foregroundColor(.white)
+          Spacer()
+          Button(action: onDismiss) {
+            Image(systemName: "xmark")
+              .font(.system(size: 13, weight: .semibold))
+              .foregroundColor(.white)
+          }
+        }
+
+        ScrollView {
+          Text(errorText ?? text ?? "")
+            .font(.system(size: 15))
+            .foregroundColor(.white)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+
+        if let note, !note.isEmpty {
+          Text(note)
+            .font(.system(size: 13, weight: .medium))
+            .foregroundColor(.white.opacity(0.85))
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+      }
+    }
+    .padding(.horizontal, 16)
+    .padding(.vertical, 14)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(errorText == nil ? Color.black.opacity(0.5) : Color.red.opacity(0.35))
+    .cornerRadius(20)
   }
 }
