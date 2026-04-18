@@ -25,7 +25,13 @@ struct StreamSessionView: View {
   init(wearables: WearablesInterface, wearablesVM: WearablesViewModel) {
     self.wearables = wearables
     self.wearablesViewModel = wearablesVM
-    self._viewModel = StateObject(wrappedValue: StreamSessionViewModel(wearables: wearables))
+    let photoOpenClawBridge = OpenClawBridge()
+    self._viewModel = StateObject(
+      wrappedValue: StreamSessionViewModel(
+        wearables: wearables,
+        openClawBridge: photoOpenClawBridge
+      )
+    )
   }
 
   var body: some View {
